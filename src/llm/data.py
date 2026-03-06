@@ -8,7 +8,10 @@ position: training the model to predict the *next* token at every step.
 from __future__ import annotations
 
 import os
-import random
+
+from llm.backend import array_module, to_numpy
+
+xp = array_module()
 
 
 # Default path to the bundled conversation corpus (relative to repo root).
@@ -33,6 +36,8 @@ class Dataset:
         self.context_length = context_length
         # We need at least context_length + 1 tokens to form one (x, y) pair.
         self._max_start = len(token_ids) - context_length - 1
+        self._token_ids_array = xp.asarray(token_ids, dtype=xp.int32)
+        self._offsets = xp.arange(context_length, dtype=xp.int32)
 
     def __len__(self) -> int:
         """Number of valid starting positions in the corpus."""
@@ -55,14 +60,25 @@ class Dataset:
                 f"Corpus too short ({len(self.token_ids)} tokens) for "
                 f"context_length={self.context_length}."
             )
-        inputs, targets = [], []
-        for _ in range(batch_size):
-            start = random.randint(0, self._max_start)
-            x = self.token_ids[start : start + self.context_length]
-            y = self.token_ids[start + 1 : start + self.context_length + 1]
-            inputs.append(x)
-            targets.append(y)
-        return inputs, targets
+        x_arr, y_arr = self.get_batch_arrays(batch_size)
+        return to_numpy(x_arr).astype(int).tolist(), to_numpy(y_arr).astype(int).tolist()
+
+    def get_batch_arrays(self, batch_size: int):
+        """Sample a random mini-batch and return backend arrays.
+
+        This path is vectorised and avoids Python loops, which is substantially
+        faster and keeps the GPU busier during training.
+        """
+        if self._max_start <= 0:
+            raise ValueError(
+                f"Corpus too short ({len(self.token_ids)} tokens) for "
+                f"context_length={self.context_length}."
+            )
+        starts = xp.random.randint(0, self._max_start + 1, size=(batch_size, 1))
+        idx = starts + self._offsets.reshape(1, -1)
+        x = self._token_ids_array[idx].astype(xp.float32)
+        y = self._token_ids_array[idx + 1].astype(xp.float32)
+        return x, y
 
 
 def load_text(path: str | None = None) -> str:

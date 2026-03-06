@@ -19,6 +19,7 @@ import numpy as np
 from llm.autograd import Tensor
 from llm.config import ModelConfig, TrainingConfig
 from llm.model import LanguageModel
+from llm.retrieval import best_match_reply, load_pairs, should_skip_retrieval
 from llm.tokenizer import Tokenizer
 from llm.trainer import load_checkpoint, train
 
@@ -32,8 +33,19 @@ HUMAN_PROMPT = "<human>: "
 ASSISTANT_PROMPT = "<assistant>: "
 TURN_SEPARATOR = "\n"
 
+# Optional steering instruction used when code-focused chat mode is enabled.
+CODING_ASSISTANT_INSTRUCTION = (
+    "You are a Python coding assistant. "
+    "When asked to write code, provide runnable Python code with short comments. "
+    "When asked to edit code, return the updated code and then a brief list of what changed."
+)
 
-def _build_prompt(history: list[tuple[str, str]], user_input: str) -> str:
+
+def _build_prompt(
+    history: list[tuple[str, str]],
+    user_input: str,
+    assistant_instruction: str | None = None,
+) -> str:
     """Assemble the full conversation context string for the model.
 
     Each past turn is rendered as::
@@ -52,6 +64,10 @@ def _build_prompt(history: list[tuple[str, str]], user_input: str) -> str:
         The full prompt string to feed into the model.
     """
     parts: list[str] = []
+    if assistant_instruction:
+        parts.append(f"{HUMAN_PROMPT}System instruction: {assistant_instruction}")
+        parts.append(f"{ASSISTANT_PROMPT}Understood.")
+
     for user_msg, asst_msg in history:
         parts.append(f"{HUMAN_PROMPT}{user_msg}")
         parts.append(f"{ASSISTANT_PROMPT}{asst_msg}")
@@ -117,9 +133,12 @@ class ChatSession:
         model: LanguageModel,
         tokenizer: Tokenizer,
         max_history_turns: int = 4,
-        max_new_tokens: int = 200,
-        temperature: float = 0.8,
-        top_k: int = 40,
+        max_new_tokens: int = 120,
+        temperature: float = 0.35,
+        top_k: int = 20,
+        retrieval_enabled: bool = True,
+        retrieval_threshold: float = 0.4,
+        coding_assistant: bool = False,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
@@ -127,6 +146,12 @@ class ChatSession:
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.top_k = top_k
+        self.retrieval_enabled = retrieval_enabled
+        self.retrieval_threshold = retrieval_threshold
+        self.assistant_instruction = (
+            CODING_ASSISTANT_INSTRUCTION if coding_assistant else None
+        )
+        self._retrieval_pairs = load_pairs()
         # History: list of (user_message, assistant_reply) pairs.
         self._history: list[tuple[str, str]] = []
 
@@ -139,11 +164,28 @@ class ChatSession:
         Returns:
             The assistant's response string.
         """
+        if self.retrieval_enabled and not should_skip_retrieval(
+            user_input,
+            coding_assistant=self.assistant_instruction is not None,
+        ):
+            retrieved = best_match_reply(
+                user_input,
+                self._retrieval_pairs,
+                threshold=self.retrieval_threshold,
+            )
+            if retrieved is not None:
+                self._history.append((user_input, retrieved))
+                return retrieved
+
         # Keep only the most recent turns to avoid overflowing context.
         recent = self._history[-self.max_history_turns :]
 
         # Build the prompt string.
-        prompt = _build_prompt(recent, user_input)
+        prompt = _build_prompt(
+            recent,
+            user_input,
+            assistant_instruction=self.assistant_instruction,
+        )
 
         # Trim to fit within the model's context window.
         ctx = self.model.config.context_length
@@ -247,26 +289,42 @@ def main() -> None:
     parser.add_argument(
         "--temperature",
         type=float,
-        default=0.8,
-        help="Sampling temperature (default: 0.8).  Higher → more creative.",
+        default=0.35,
+        help="Sampling temperature (default: 0.35). Higher -> more creative.",
     )
     parser.add_argument(
         "--top-k",
         type=int,
-        default=40,
-        help="Top-k sampling (default: 40).  Use 0 to disable.",
+        default=20,
+        help="Top-k sampling (default: 20). Use 0 to disable.",
     )
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=200,
-        help="Maximum tokens to generate per reply (default: 200).",
+        default=120,
+        help="Maximum tokens to generate per reply (default: 120).",
     )
     parser.add_argument(
         "--history-turns",
         type=int,
         default=4,
         help="Number of past turns to keep in context (default: 4).",
+    )
+    parser.add_argument(
+        "--no-retrieval",
+        action="store_true",
+        help="Disable retrieval fallback from training conversation pairs.",
+    )
+    parser.add_argument(
+        "--retrieval-threshold",
+        type=float,
+        default=0.4,
+        help="Similarity threshold for retrieval fallback (default: 0.4).",
+    )
+    parser.add_argument(
+        "--coding-assistant",
+        action="store_true",
+        help="Bias responses toward writing/editing Python code.",
     )
     parser.add_argument(
         "--train",
@@ -323,6 +381,9 @@ def main() -> None:
         max_new_tokens=args.max_tokens,
         temperature=args.temperature,
         top_k=args.top_k,
+        retrieval_enabled=not args.no_retrieval,
+        retrieval_threshold=args.retrieval_threshold,
+        coding_assistant=args.coding_assistant,
     )
     _repl(session)
 

@@ -10,9 +10,26 @@ dependencies = [
     "numpy>=1.26.0",
 ]
 
+[project.optional-dependencies]
+# Install with: uv sync --extra gpu
+# Note: choose the CuPy wheel matching your CUDA runtime.
+gpu = [
+    "cupy-cuda12x>=13.0.0",
+]
+
+# Install with: uv sync --extra torch
+# Note: select/override the wheel source as needed for your CUDA or CPU target.
+torch = [
+    "torch>=2.5.0",
+]
+
 [project.scripts]
 # Train the model on the bundled conversation dataset.
 llm-train = "llm.trainer:main"
+# Train the model with PyTorch on CUDA.
+llm-train-torch = "llm.torch_trainer:main"
+# Chat with a PyTorch-trained checkpoint.
+llm-chat-torch = "llm.torch_chat:main"
 # Start an interactive chat session.
 llm-chat = "llm.chat:main"
 

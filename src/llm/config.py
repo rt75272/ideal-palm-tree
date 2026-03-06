@@ -18,21 +18,21 @@ class ModelConfig:
 
     # ---- Vocabulary / tokeniser ----------------------------------------
     # Filled in automatically by the Tokenizer after it reads the data.
-    vocab_size: int = 128
+    vocab_size: int = 512
 
     # ---- Sequence length -----------------------------------------------
     # Maximum number of tokens the model can see at once (context window).
-    context_length: int = 128
+    context_length: int = 256
 
     # ---- Transformer dimensions ----------------------------------------
     # Width of every embedding vector and every hidden state.
-    d_model: int = 128
+    d_model: int = 256
     # Number of parallel attention heads (d_model must be divisible by n_heads).
-    n_heads: int = 4
+    n_heads: int = 8
     # Number of stacked transformer blocks.
-    n_layers: int = 4
+    n_layers: int = 6
     # Hidden dimension of the position-wise feed-forward network (typically 4×d_model).
-    d_ff: int = 512
+    d_ff: int = 1024
 
     # ---- Regularisation ------------------------------------------------
     # Dropout probability — applied during training, disabled at inference.
@@ -52,10 +52,16 @@ class TrainingConfig:
     grad_clip: float = 1.0    # Maximum allowed gradient norm (gradient clipping).
 
     # ---- Training loop -------------------------------------------------
-    batch_size: int = 16
+    batch_size: int = 32
     max_epochs: int = 100
     # Evaluate loss on a validation split every this many epochs.
     eval_interval: int = 10
+    # Number of mini-batches used when estimating validation loss.
+    eval_batches: int = 5
+
+    # ---- Throughput -----------------------------------------------------
+    # If True, apply aggressive throughput-oriented tuning when on GPU.
+    gpu_boost: bool = True
 
     # ---- Checkpointing -------------------------------------------------
     # File where trained weights are saved (NumPy .npz format).

@@ -19,6 +19,7 @@ import math
 import numpy as np
 
 from llm.autograd import Tensor
+from llm.backend import array_module, to_numpy
 from llm.config import ModelConfig
 from llm.nn import (
     Dropout,
@@ -28,6 +29,8 @@ from llm.nn import (
     Module,
     TransformerBlock,
 )
+
+xp = array_module()
 
 
 class LanguageModel(Module):
@@ -99,7 +102,7 @@ class LanguageModel(Module):
         tok_emb = self.token_emb(idx)  # (B, T, d_model)
 
         # Build a position index tensor [0, 1, …, T-1].
-        positions = Tensor(np.arange(T, dtype=np.float32).reshape(1, T))
+        positions = Tensor(xp.arange(T, dtype=xp.float32).reshape(1, T))
         pos_emb = self.pos_emb(positions)  # (1, T, d_model)
 
         x = self.emb_dropout(tok_emb + pos_emb)  # (B, T, d_model)
@@ -142,7 +145,7 @@ class LanguageModel(Module):
         # token at each position using integer indexing.
         target_ids = targets_flat.data.astype(int)
         # Build a Tensor view of just the correct class log-probs.
-        correct_log_probs = log_probs[np.arange(B * T), target_ids]  # (B·T,)
+        correct_log_probs = log_probs[xp.arange(B * T), target_ids]  # (B·T,)
         loss = -correct_log_probs.mean()
         return loss
 
@@ -158,9 +161,9 @@ class LanguageModel(Module):
         # Clamp k to the vocabulary size to avoid out-of-bounds partition.
         k = min(k, len(logits))
         # Find the k-th largest value.
-        threshold = np.partition(logits, -k)[-k]
+        threshold = xp.partition(logits, -k)[-k]
         # Mask values below the threshold with a large negative number.
-        filtered = np.where(logits >= threshold, logits, -1e9)
+        filtered = xp.where(logits >= threshold, logits, -1e9)
         return filtered
 
     def generate(
@@ -169,6 +172,7 @@ class LanguageModel(Module):
         max_new_tokens: int = 200,
         temperature: float = 0.8,
         top_k: int = 40,
+        stop_token_ids: set[int] | None = None,
     ) -> list[int]:
         """Generate token IDs auto-regressively starting from *prompt_ids*.
 
@@ -177,6 +181,8 @@ class LanguageModel(Module):
             max_new_tokens: Maximum number of tokens to generate.
             temperature:    Sampling temperature (higher → more random).
             top_k:          If > 0, restrict sampling to the top-k tokens.
+            stop_token_ids: Optional set of token IDs that end generation
+                            once produced.
 
         Returns:
             The prompt IDs followed by the generated IDs.
@@ -188,7 +194,7 @@ class LanguageModel(Module):
         for _ in range(max_new_tokens):
             # Trim the context window to the last *ctx* tokens.
             window = ids[-ctx:]
-            idx_t = Tensor(np.array(window, dtype=np.float32).reshape(1, -1))
+            idx_t = Tensor(xp.asarray(window, dtype=xp.float32).reshape(1, -1))
 
             # Forward pass — we only need the logits for the *last* position.
             logits = self.forward(idx_t)              # (1, T, V)
@@ -202,15 +208,15 @@ class LanguageModel(Module):
 
             # Convert to probabilities via softmax.
             shifted = last_logits - last_logits.max()
-            probs = np.exp(shifted) / np.exp(shifted).sum()
+            probs = xp.exp(shifted) / xp.exp(shifted).sum()
 
             # Sample the next token.
-            next_id = int(np.random.choice(len(probs), p=probs))
+            probs_np = to_numpy(probs)
+            next_id = int(np.random.choice(len(probs_np), p=probs_np))
             ids.append(next_id)
 
-            # Stop early if we encounter a newline after generating some tokens
-            # (natural sentence boundary — optional heuristic).
-            if len(ids) > len(prompt_ids) + 10 and next_id == 0:
+            # Stop early on configured boundary tokens (for example newline).
+            if stop_token_ids is not None and len(ids) > len(prompt_ids) + 10 and next_id in stop_token_ids:
                 break
 
         return ids

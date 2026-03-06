@@ -14,17 +14,26 @@ trains the model on the bundled conversation dataset and saves the weights.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 import time
 
 import numpy as np
 
+try:
+    import cupy as cp  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - environment dependent
+    cp = None
+
 from llm.autograd import Tensor
+from llm.backend import array_module, get_backend_warning, get_device, seed, to_scalar
 from llm.config import ModelConfig, TrainingConfig
 from llm.data import Dataset, load_text, train_val_split
 from llm.model import LanguageModel
 from llm.tokenizer import Tokenizer
+
+xp = array_module()
 
 
 # ---------------------------------------------------------------------------
@@ -60,8 +69,8 @@ class Adam:
         self.t: int = 0  # timestep counter
 
         # Initialise moment estimates to zero for each parameter.
-        self.m: list[np.ndarray] = [np.zeros_like(p.data) for p in parameters]
-        self.v: list[np.ndarray] = [np.zeros_like(p.data) for p in parameters]
+        self.m = [xp.zeros_like(p.data) for p in parameters]
+        self.v = [xp.zeros_like(p.data) for p in parameters]
 
     def step(self) -> None:
         """Perform one optimisation step using the current gradients."""
@@ -90,7 +99,7 @@ class Adam:
             v_hat = self.v[i] / bc2
 
             # Parameter update.
-            p.data -= self.lr * m_hat / (np.sqrt(v_hat) + self.epsilon)
+            p.data -= self.lr * m_hat / (xp.sqrt(v_hat) + self.epsilon)
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +114,7 @@ def clip_gradients(parameters: list[Tensor], max_norm: float) -> float:
     total_norm = 0.0
     for p in parameters:
         if p.requires_grad and p.grad is not None:
-            total_norm += float(np.sum(p.grad**2))
+            total_norm += to_scalar(xp.sum(p.grad**2))
     total_norm = math.sqrt(total_norm)
 
     if total_norm > max_norm:
@@ -134,22 +143,46 @@ def _compute_loss(
     model.eval()
     losses = []
     for _ in range(n_batches):
-        x_list, y_list = dataset.get_batch(batch_size)
-        x_arr = np.array(x_list, dtype=np.float32)
-        y_arr = np.array(y_list, dtype=np.float32)
+        x_arr, y_arr = dataset.get_batch_arrays(batch_size)
         x_t = Tensor(x_arr)
         y_t = Tensor(y_arr)
         loss = model.loss(x_t, y_t)
-        losses.append(float(loss.data))
+        losses.append(to_scalar(loss.data))
     model.train()
-    return float(np.mean(losses))
+    return float(sum(losses) / len(losses))
 
 
 # ---------------------------------------------------------------------------
 # Main training function
 # ---------------------------------------------------------------------------
 
-import math  # noqa: E402  (placed here to keep the module header clean)
+
+def _apply_gpu_boost(mc: ModelConfig, tc: TrainingConfig) -> None:
+    """Push settings toward higher throughput when running on GPU."""
+    if not tc.gpu_boost:
+        return
+    # Bigger batches generally increase GPU occupancy and tokens/sec.
+    tc.batch_size = max(tc.batch_size, 64)
+    # Reduce validation frequency/volume to spend more time on train steps.
+    tc.eval_interval = max(tc.eval_interval, 50)
+    tc.eval_batches = min(tc.eval_batches, 2)
+    # Slightly reduce dropout so fewer masked ops run in the hot path.
+    mc.dropout = min(mc.dropout, 0.05)
+
+
+def _is_gpu_oom_error(exc: Exception) -> bool:
+    """Detect out-of-memory exceptions from CuPy backends."""
+    if cp is not None and isinstance(exc, cp.cuda.memory.OutOfMemoryError):
+        return True
+    return "outofmemory" in type(exc).__name__.lower() or "out of memory" in str(exc).lower()
+
+
+def _free_cupy_memory_pool() -> None:
+    """Release cached CuPy allocations after an OOM before retrying."""
+    if cp is None:
+        return
+    cp.get_default_memory_pool().free_all_blocks()
+    cp.get_default_pinned_memory_pool().free_all_blocks()
 
 
 def train(
@@ -165,6 +198,17 @@ def train(
     tc = train_config or TrainingConfig()
 
     # ---- Load data ---------------------------------------------------------
+    if get_device() == "gpu":
+        print("Using GPU backend (CuPy).")
+    else:
+        print("Using CPU backend (NumPy).")
+        warning = get_backend_warning()
+        if warning:
+            print(f"  Backend note: {warning}")
+
+    if get_device() == "gpu":
+        _apply_gpu_boost(mc, tc)
+
     print("Loading training data…")
     text = load_text(data_path)
     print(f"  Corpus size: {len(text):,} characters")
@@ -184,7 +228,7 @@ def train(
     print(f"  Train tokens: {len(train_ids):,} | Val tokens: {len(val_ids):,}")
 
     # ---- Build model -------------------------------------------------------
-    np.random.seed(42)  # reproducibility
+    seed(42)  # reproducibility across NumPy/CuPy
     model = LanguageModel(mc)
     model.train()
     params = list(model.parameters())
@@ -201,33 +245,55 @@ def train(
     )
 
     # ---- Training loop -----------------------------------------------------
-    print(f"\nTraining for {tc.max_epochs} epochs…")
+    print(
+        f"\nTraining for {tc.max_epochs} epochs "
+        f"(batch_size={tc.batch_size}, eval_interval={tc.eval_interval})…"
+    )
     start_time = time.time()
 
+    batch_size = tc.batch_size
+
     for epoch in range(1, tc.max_epochs + 1):
-        # Sample a mini-batch.
-        x_list, y_list = train_data.get_batch(tc.batch_size)
-        x_arr = np.array(x_list, dtype=np.float32)
-        y_arr = np.array(y_list, dtype=np.float32)
-        x_t = Tensor(x_arr)
-        y_t = Tensor(y_arr)
+        while True:
+            try:
+                # Sample a mini-batch.
+                x_arr, y_arr = train_data.get_batch_arrays(batch_size)
+                x_t = Tensor(x_arr)
+                y_t = Tensor(y_arr)
 
-        # Zero gradients, forward pass, backward pass.
-        model.zero_grad()
-        loss = model.loss(x_t, y_t)
-        loss.backward()
+                # Zero gradients, forward pass, backward pass.
+                model.zero_grad()
+                loss = model.loss(x_t, y_t)
+                loss.backward()
 
-        # Clip gradients and update parameters.
-        clip_gradients(params, tc.grad_clip)
-        optimiser.step()
+                # Clip gradients and update parameters.
+                clip_gradients(params, tc.grad_clip)
+                optimiser.step()
+                break
+            except Exception as exc:
+                if get_device() != "gpu" or not _is_gpu_oom_error(exc):
+                    raise
+                if batch_size <= 1:
+                    raise RuntimeError(
+                        "GPU ran out of memory even at batch_size=1. "
+                        "Try reducing model size or use CPU/PyTorch trainer."
+                    ) from exc
+                new_batch_size = max(1, batch_size // 2)
+                print(
+                    "  GPU OOM detected. "
+                    f"Reducing batch size from {batch_size} to {new_batch_size} and retrying..."
+                )
+                batch_size = new_batch_size
+                _free_cupy_memory_pool()
 
         # ---- Periodic logging ----------------------------------------------
         if epoch % tc.eval_interval == 0 or epoch == tc.max_epochs:
             elapsed = time.time() - start_time
-            val_loss = _compute_loss(model, val_data, tc.batch_size)
-            train_loss = float(loss.data)
+            val_loss = _compute_loss(model, val_data, batch_size, tc.eval_batches)
+            train_loss = to_scalar(loss.data)
             print(
                 f"  Epoch {epoch:>5}/{tc.max_epochs} | "
+                f"batch: {batch_size} | "
                 f"train loss: {train_loss:.4f} | "
                 f"val loss: {val_loss:.4f} | "
                 f"elapsed: {elapsed:.1f}s"
@@ -261,9 +327,9 @@ def _save_checkpoint(
         "__n_heads": np.array(config.n_heads),
         "__n_layers": np.array(config.n_layers),
         "__d_ff": np.array(config.d_ff),
-        # Encode the vocabulary JSON as a bytes array.
-        "__vocab_json": np.frombuffer(
-            _vocab_to_json(tokenizer).encode("utf-8"), dtype=np.uint8
+        # Encode the tokenizer state JSON as a bytes array.
+        "__tokenizer_json": np.frombuffer(
+            _tokenizer_to_json(tokenizer).encode("utf-8"), dtype=np.uint8
         ),
     }
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
@@ -291,13 +357,13 @@ def load_checkpoint(
 
     # Restore tokeniser.
     import json
-    vocab_json = bytes(data["__vocab_json"].tolist()).decode("utf-8")
+    tokenizer_key = "__tokenizer_json" if "__tokenizer_json" in data.files else "__vocab_json"
+    vocab_json = bytes(data[tokenizer_key].tolist()).decode("utf-8")
     tokenizer = Tokenizer()
-    tokenizer._char_to_idx = json.loads(vocab_json)
-    tokenizer._idx_to_char = {v: k for k, v in tokenizer._char_to_idx.items()}
+    tokenizer.load_state(json.loads(vocab_json))
 
     # Rebuild model.
-    np.random.seed(0)
+    seed(0)
     model = LanguageModel(config)
 
     # Load weights (skip the metadata keys that start with "__").
@@ -307,9 +373,9 @@ def load_checkpoint(
     return model, tokenizer
 
 
-def _vocab_to_json(tokenizer: Tokenizer) -> str:
+def _tokenizer_to_json(tokenizer: Tokenizer) -> str:
     import json
-    return json.dumps(tokenizer._char_to_idx, ensure_ascii=False)
+    return json.dumps(tokenizer.to_state(), ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
@@ -341,8 +407,13 @@ def main() -> None:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=16,
-        help="Mini-batch size (default: 16).",
+        default=32,
+        help="Mini-batch size (default: 32).",
+    )
+    parser.add_argument(
+        "--no-gpu-boost",
+        action="store_true",
+        help="Disable aggressive GPU throughput tuning.",
     )
     parser.add_argument(
         "--checkpoint",
@@ -356,6 +427,7 @@ def main() -> None:
         learning_rate=args.lr,
         batch_size=args.batch_size,
         checkpoint_path=args.checkpoint,
+        gpu_boost=not args.no_gpu_boost,
     )
 
     try:

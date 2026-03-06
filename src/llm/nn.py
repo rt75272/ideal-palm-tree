@@ -18,6 +18,9 @@ from typing import Iterator
 import numpy as np
 
 from llm.autograd import Tensor
+from llm.backend import array_module, to_numpy
+
+xp = array_module()
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +102,7 @@ class Module:
         for name, value in module.__dict__.items():
             key = f"{prefix}{name}" if prefix else name
             if isinstance(value, Tensor) and value.requires_grad:
-                out[key] = value.data
+                out[key] = to_numpy(value.data)
             elif isinstance(value, Module):
                 self._collect_state(value, key + ".", out)
             elif isinstance(value, list):
@@ -114,7 +117,7 @@ class Module:
             key = f"{prefix}{name}" if prefix else name
             if isinstance(value, Tensor) and value.requires_grad:
                 if key in state:
-                    value.data = state[key].astype(np.float32)
+                    value.data = xp.asarray(state[key], dtype=xp.float32)
             elif isinstance(value, Module):
                 self._apply_state(value, key + ".", state)
             elif isinstance(value, list):
@@ -143,7 +146,7 @@ class Embedding(Module):
         # Initialise with small random values (scaled by 1/sqrt(embedding_dim)).
         scale = 1.0 / math.sqrt(embedding_dim)
         self.weight = Tensor(
-            np.random.randn(num_embeddings, embedding_dim).astype(np.float32) * scale,
+            xp.random.randn(num_embeddings, embedding_dim).astype(xp.float32) * scale,
             requires_grad=True,
         )
 
@@ -179,12 +182,12 @@ class Linear(Module):
         # Kaiming uniform initialisation (good default for layers before ReLU/GELU).
         scale = math.sqrt(2.0 / in_features)
         self.weight = Tensor(
-            np.random.randn(in_features, out_features).astype(np.float32) * scale,
+            xp.random.randn(in_features, out_features).astype(xp.float32) * scale,
             requires_grad=True,
         )
         if bias:
             self.bias: Tensor | None = Tensor(
-                np.zeros(out_features, dtype=np.float32), requires_grad=True
+                xp.zeros(out_features, dtype=xp.float32), requires_grad=True
             )
         else:
             self.bias = None
@@ -209,8 +212,8 @@ class LayerNorm(Module):
         super().__init__()
         self.eps = eps
         # Learnable scale and shift (initialised to 1 and 0 respectively).
-        self.gamma = Tensor(np.ones(d_model, dtype=np.float32), requires_grad=True)
-        self.beta = Tensor(np.zeros(d_model, dtype=np.float32), requires_grad=True)
+        self.gamma = Tensor(xp.ones(d_model, dtype=xp.float32), requires_grad=True)
+        self.beta = Tensor(xp.zeros(d_model, dtype=xp.float32), requires_grad=True)
 
     def forward(self, x: Tensor) -> Tensor:  # type: ignore[override]
         # Compute mean and variance along the last axis (the feature dimension).
@@ -239,7 +242,7 @@ class Dropout(Module):
             return x
         # Bernoulli mask scaled by 1/(1-p) so the expected value is unchanged.
         keep_prob = 1.0 - self.p
-        mask = (np.random.rand(*x.shape) < keep_prob).astype(np.float32)
+        mask = (xp.random.rand(*x.shape) < keep_prob).astype(xp.float32)
         # We build a new Tensor so the mask is baked into the computation graph.
         mask_t = Tensor(mask / keep_prob)
         return x * mask_t
@@ -291,7 +294,7 @@ class MultiHeadAttention(Module):
 
         # Pre-computed causal mask: lower-triangular of ones.
         # Shape: (1, 1, context_length, context_length) for broadcasting.
-        causal = np.tril(np.ones((context_length, context_length), dtype=np.float32))
+        causal = xp.tril(xp.ones((context_length, context_length), dtype=xp.float32))
         self._causal_mask = causal  # plain numpy, not a Tensor parameter
 
     def forward(self, x: Tensor) -> Tensor:  # type: ignore[override]

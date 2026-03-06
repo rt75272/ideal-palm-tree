@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from llm.autograd import Tensor
+from llm.backend import to_numpy
 from llm.config import ModelConfig, TrainingConfig
 from llm.model import LanguageModel
 from llm.tokenizer import Tokenizer
@@ -130,7 +131,7 @@ class TestAdam:
         w = Tensor(np.ones((3,), dtype=np.float32), requires_grad=True)
         w.grad = np.ones((3,), dtype=np.float32)
         w.zero_grad()
-        np.testing.assert_array_equal(w.grad, np.zeros(3))
+        np.testing.assert_array_equal(to_numpy(w.grad), np.zeros(3))
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +144,7 @@ class TestGradClipping:
         p.grad = np.ones(10, dtype=np.float32) * 10.0  # norm = 10*sqrt(10) >> 1
 
         clip_gradients([p], max_norm=1.0)
-        clipped_norm = float(np.linalg.norm(p.grad))
+        clipped_norm = float(np.linalg.norm(to_numpy(p.grad)))
         assert clipped_norm == pytest.approx(1.0, rel=1e-4)
 
     def test_does_not_clip_small_gradient(self):
@@ -151,7 +152,7 @@ class TestGradClipping:
         p.grad = np.array([0.1, 0.1, 0.1], dtype=np.float32)
         original_grad = p.grad.copy()
         clip_gradients([p], max_norm=10.0)
-        np.testing.assert_array_almost_equal(p.grad, original_grad)
+        np.testing.assert_array_almost_equal(to_numpy(p.grad), to_numpy(original_grad))
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +207,6 @@ class TestCheckpoint:
 
             # Check weights are identical.
             for p1, p2 in zip(small_model.parameters(), loaded_model.parameters()):
-                np.testing.assert_array_almost_equal(p1.data, p2.data)
+                np.testing.assert_array_almost_equal(to_numpy(p1.data), to_numpy(p2.data))
         finally:
             os.unlink(path)

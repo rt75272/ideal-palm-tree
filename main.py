@@ -70,8 +70,8 @@ def main() -> None:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=16,
-        help="Mini-batch size (default: 16).",
+        default=32,
+        help="Mini-batch size (default: 32).",
     )
     parser.add_argument(
         "--temperature",

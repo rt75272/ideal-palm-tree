@@ -1,4 +1,4 @@
-"""Minimal automatic-differentiation engine backed by NumPy.
+"""Minimal automatic-differentiation engine backed by NumPy/CuPy.
 
 Every mathematical operation on a :class:`Tensor` records a *backward*
 function so that :meth:`Tensor.backward` can later propagate gradients
@@ -10,23 +10,25 @@ entirely in plain Python + NumPy — no ML framework is used.
 
 from __future__ import annotations
 
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
-import numpy as np
+from llm.backend import array_module
+
+xp = array_module()
 
 
 # ---------------------------------------------------------------------------
 # Helper utilities
 # ---------------------------------------------------------------------------
 
-def _ensure_tensor(value: "Tensor | np.ndarray | float | int") -> "Tensor":
+def _ensure_tensor(value: "Tensor | Any | float | int") -> "Tensor":
     """Wrap a raw value in a Tensor if it is not already one."""
     if isinstance(value, Tensor):
         return value
     return Tensor(value)
 
 
-def _unbroadcast(grad: np.ndarray, target_shape: tuple[int, ...]) -> np.ndarray:
+def _unbroadcast(grad: Any, target_shape: tuple[int, ...]) -> Any:
     """Reduce *grad* so its shape matches *target_shape*.
 
     NumPy broadcasting can implicitly expand dimensions; when computing
@@ -67,14 +69,14 @@ class Tensor:
 
     def __init__(
         self,
-        data: np.ndarray | list | float | int,
+        data: Any | list | float | int,
         requires_grad: bool = False,
         _children: tuple["Tensor", ...] = (),
         _op: str = "",
     ) -> None:
-        self.data: np.ndarray = np.asarray(data, dtype=np.float32)
+        self.data = xp.asarray(data, dtype=xp.float32)
         # Gradient accumulates here during backprop (same shape as data).
-        self.grad: np.ndarray = np.zeros_like(self.data)
+        self.grad = xp.zeros_like(self.data)
         # Automatically propagate requires_grad: if any parent needs a gradient,
         # this intermediate tensor also needs one so the chain rule can flow through.
         self.requires_grad: bool = requires_grad or any(
@@ -110,7 +112,7 @@ class Tensor:
 
     def zero_grad(self) -> None:
         """Set the gradient buffer to zero (called before each forward pass)."""
-        self.grad = np.zeros_like(self.data)
+        self.grad = xp.zeros_like(self.data)
 
     # ------------------------------------------------------------------
     # Arithmetic operators
@@ -186,11 +188,11 @@ class Tensor:
         def _backward() -> None:
             if self.requires_grad:
                 # dL/dA = dL/dC @ B^T
-                grad_a = out.grad @ np.swapaxes(other.data, -1, -2)
+                grad_a = out.grad @ xp.swapaxes(other.data, -1, -2)
                 self.grad += _unbroadcast(grad_a, self.data.shape)
             if other.requires_grad:
                 # dL/dB = A^T @ dL/dC  — sum over any batch dims not in B.
-                grad_b = np.swapaxes(self.data, -1, -2) @ out.grad
+                grad_b = xp.swapaxes(self.data, -1, -2) @ out.grad
                 other.grad += _unbroadcast(grad_b, other.data.shape)
 
         out._backward = _backward
@@ -204,7 +206,7 @@ class Tensor:
             perm[-2], perm[-1] = perm[-1], perm[-2]
         else:
             perm = list(axes)
-        out = Tensor(np.transpose(self.data, perm), _children=(self,), _op="T")
+        out = Tensor(xp.transpose(self.data, perm), _children=(self,), _op="T")
 
         def _backward() -> None:
             if self.requires_grad:
@@ -212,7 +214,7 @@ class Tensor:
                 inv_perm = [0] * len(perm)
                 for i, p in enumerate(perm):
                     inv_perm[p] = i
-                self.grad += np.transpose(out.grad, inv_perm)
+                self.grad += xp.transpose(out.grad, inv_perm)
 
         out._backward = _backward
         return out
@@ -234,7 +236,7 @@ class Tensor:
         def _backward() -> None:
             if self.requires_grad:
                 # Scatter the gradient back to the indexed positions.
-                np.add.at(self.grad, idx, out.grad)
+                xp.add.at(self.grad, idx, out.grad)
 
         out._backward = _backward
         return out
@@ -259,8 +261,8 @@ class Tensor:
                 grad = out.grad
                 if not keepdims and axis is not None:
                     # Re-insert the summed-away axis so broadcasting works.
-                    grad = np.expand_dims(grad, axis=axis)
-                self.grad += grad * np.ones_like(self.data)
+                    grad = xp.expand_dims(grad, axis=axis)
+                self.grad += grad * xp.ones_like(self.data)
 
         out._backward = _backward
         return out
@@ -278,7 +280,7 @@ class Tensor:
     # ------------------------------------------------------------------
 
     def exp(self) -> "Tensor":
-        out = Tensor(np.exp(self.data), _children=(self,), _op="exp")
+        out = Tensor(xp.exp(self.data), _children=(self,), _op="exp")
 
         def _backward() -> None:
             if self.requires_grad:
@@ -290,7 +292,7 @@ class Tensor:
     def log(self) -> "Tensor":
         """Natural logarithm (numerically stabilised with a small epsilon)."""
         eps = 1e-8
-        out = Tensor(np.log(self.data + eps), _children=(self,), _op="log")
+        out = Tensor(xp.log(self.data + eps), _children=(self,), _op="log")
 
         def _backward() -> None:
             if self.requires_grad:
@@ -303,11 +305,11 @@ class Tensor:
         return self ** 0.5
 
     def relu(self) -> "Tensor":
-        out = Tensor(np.maximum(0.0, self.data), _children=(self,), _op="relu")
+        out = Tensor(xp.maximum(0.0, self.data), _children=(self,), _op="relu")
 
         def _backward() -> None:
             if self.requires_grad:
-                self.grad += (self.data > 0).astype(np.float32) * out.grad
+                self.grad += (self.data > 0).astype(xp.float32) * out.grad
 
         out._backward = _backward
         return out
@@ -317,7 +319,7 @@ class Tensor:
 
         gelu(x) ≈ x · σ(1.702 x)   where σ is the logistic sigmoid.
         """
-        sigmoid_val = 1.0 / (1.0 + np.exp(-1.702 * self.data))
+        sigmoid_val = 1.0 / (1.0 + xp.exp(-1.702 * self.data))
         out = Tensor(self.data * sigmoid_val, _children=(self,), _op="gelu")
 
         def _backward() -> None:
@@ -334,7 +336,7 @@ class Tensor:
         """Numerically stable softmax along *axis*."""
         # Subtract max for numerical stability (doesn't change the result).
         shifted = self.data - self.data.max(axis=axis, keepdims=True)
-        e_x = np.exp(shifted)
+        e_x = xp.exp(shifted)
         s = e_x / e_x.sum(axis=axis, keepdims=True)
         out = Tensor(s, _children=(self,), _op="softmax")
 
@@ -350,14 +352,14 @@ class Tensor:
     def log_softmax(self, axis: int = -1) -> "Tensor":
         """Numerically stable log-softmax (preferred over log(softmax(x)))."""
         shifted = self.data - self.data.max(axis=axis, keepdims=True)
-        log_sum_exp = np.log(np.exp(shifted).sum(axis=axis, keepdims=True))
+        log_sum_exp = xp.log(xp.exp(shifted).sum(axis=axis, keepdims=True))
         out_data = shifted - log_sum_exp
         out = Tensor(out_data, _children=(self,), _op="log_softmax")
 
         def _backward() -> None:
             if self.requires_grad:
                 # d log_softmax / dx = I − softmax(x)
-                sm = np.exp(out_data)
+                sm = xp.exp(out_data)
                 self.grad += out.grad - sm * out.grad.sum(axis=axis, keepdims=True)
 
         out._backward = _backward
@@ -371,16 +373,16 @@ class Tensor:
     def cat(tensors: Sequence["Tensor"], axis: int = 0) -> "Tensor":
         """Concatenate tensors along *axis* (like np.concatenate)."""
         out = Tensor(
-            np.concatenate([t.data for t in tensors], axis=axis),
+            xp.concatenate([t.data for t in tensors], axis=axis),
             _children=tuple(tensors),
             _op="cat",
         )
         # Pre-compute split indices for the backward pass.
         sizes = [t.data.shape[axis] for t in tensors]
-        splits = np.cumsum(sizes[:-1]).tolist()
+        splits = xp.cumsum(sizes[:-1]).tolist()
 
         def _backward() -> None:
-            grads = np.split(out.grad, splits, axis=axis)
+            grads = xp.split(out.grad, splits, axis=axis)
             for t, g in zip(tensors, grads):
                 if t.requires_grad:
                     t.grad += g
@@ -412,7 +414,7 @@ class Tensor:
         _build_topo(self)
 
         # Seed gradient: dL/dL = 1.
-        self.grad = np.ones_like(self.data)
+        self.grad = xp.ones_like(self.data)
 
         # Walk the graph in reverse, calling each node's backward closure.
         for v in reversed(topo):
